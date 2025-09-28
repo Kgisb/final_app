@@ -545,277 +545,123 @@ def render_period_block(
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ======================
-# Predictibility helpers
+# Predictibility — helpers (drop-in, safe; does not affect other views)
 # ======================
-def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
-    d = df.copy()
-    d["_create_dt"] = coerce_datetime(df[create_col])
-    d["_pay_dt"]    = coerce_datetime(df[pay_col])
-    d["_create_m"]  = d["_create_dt"].dt.to_period("M")
-    d["_pay_m"]     = d["_pay_dt"].dt.to_period("M")
-    d["_same_month"] = (d["_create_m"] == d["_pay_m"])
-    return d
+from calendar import monthrange as _mr
 
-def per_source_monthly_counts(d_hist: pd.DataFrame, source_col: str):
-    if d_hist.empty:
-        return pd.DataFrame(columns=["_pay_m", source_col, "cnt_same", "cnt_prev", "days_in_month"])
-    g = d_hist.groupby(["_pay_m", source_col])
-    by = g["_same_month"].agg(
-        cnt_same=lambda s: int(s.sum()),
-        cnt_prev=lambda s: int((~s).sum())
-    ).reset_index()
-    by["days_in_month"] = by["_pay_m"].apply(lambda p: monthrange(p.year, p.month)[1])
-    return by
+def _safe_date_series(df, col):
+    return coerce_datetime(df[col]).dt.date if (col and col in df.columns) else pd.Series(pd.NaT, index=df.index)
 
-def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
-    if d_hist.empty:
-        return {}, {}, 0.0, 0.0
+def _month_bounds_for(dt: date):
+    start = dt.replace(day=1)
+    days_in_mo = _mr(start.year, start.month)[1]
+    end = start.replace(day=days_in_mo)
+    return start, end, days_in_mo
 
-    months = sorted(d_hist["_pay_m"].unique())
-    months = months[-lookback:] if len(months) > lookback else months
-    d_hist = d_hist[d_hist["_pay_m"].isin(months)].copy()
+def _shift_months(dt: date, k: int):
+    y, m = dt.year, dt.month
+    m2 = m + k
+    y += (m2 - 1) // 12
+    m2 = ((m2 - 1) % 12) + 1
+    d = min(dt.day, _mr(y, m2)[1])
+    return date(y, m2, d)
 
-    by = per_source_monthly_counts(d_hist, source_col)
-    month_to_w = {m: (i+1 if weighted else 1.0) for i, m in enumerate(sorted(months))}
+def _build_history(df_f: pd.DataFrame, pay_col: str|None, source_col: str|None, today: date, lookback: int):
+    """Return last `lookback` FULL months (excluding current): (hist_totals, hist_by_source)."""
+    if df_f is None or df_f.empty or not lookback:
+        return pd.DataFrame(), pd.DataFrame()
 
-    rates_same, rates_prev = {}, {}
-    for src, sub in by.groupby(source_col):
-        w = sub["_pay_m"].map(month_to_w)
-        num_same = (sub["cnt_same"] / sub["days_in_month"] * w).sum()
-        num_prev = (sub["cnt_prev"] / sub["days_in_month"] * w).sum()
-        den = w.sum()
-        rates_same[str(src)] = float(num_same/den) if den > 0 else 0.0
-        rates_prev[str(src)] = float(num_prev/den) if den > 0 else 0.0
-
-    by_overall = d_hist.groupby("_pay_m")["_same_month"].agg(
-        cnt_same=lambda s: int(s.sum()),
-        cnt_prev=lambda s: int((~s).sum())
-    ).reset_index()
-    by_overall["days_in_month"] = by_overall["_pay_m"].apply(lambda p: monthrange(p.year, p.month)[1])
-    w_all = by_overall["_pay_m"].map(month_to_w)
-    num_same_o = (by_overall["cnt_same"] / by_overall["days_in_month"] * w_all).sum()
-    num_prev_o = (by_overall["cnt_prev"] / by_overall["days_in_month"] * w_all).sum()
-    den_o = w_all.sum()
-    overall_same_rate = float(num_same_o/den_o) if den_o > 0 else 0.0
-    overall_prev_rate = float(num_prev_o/den_o) if den_o > 0 else 0.0
-    return rates_same, rates_prev, overall_same_rate, overall_prev_rate
-
-def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
-                          lookback: int, weighted: bool, today: date):
-    if source_col is None or source_col not in df_f.columns:
-        df_work = df_f.copy()
-        source_col = "_Source"
-        df_work[source_col] = "All"
+    pay = _safe_date_series(df_f, pay_col)
+    if source_col and source_col in df_f.columns:
+        src = df_f[source_col].fillna("Unknown").astype(str).str.strip()
     else:
-        df_work = df_f.copy()
-        # include blank/NaN deal sources as "Unknown" so they are counted
-        df_work[source_col] = df_work[source_col].fillna("Unknown").astype(str)
+        src = pd.Series("All", index=df_f.index)
 
-    d = add_month_cols(df_work, create_col, pay_col)
-
-    cur_start, cur_end = month_bounds(today)
-    cur_period = pd.Period(today, freq="M")
-
-    d_cur = d[d["_pay_m"] == cur_period].copy()
-    if d_cur.empty:
-        realized_by_src = pd.DataFrame(columns=[source_col, "A"])
-    else:
-        # include Unknown deal source in Actual-to-date
-        realized_by_src = (
-            d_cur.assign({source_col: d_cur[source_col].fillna("Unknown").astype(str)})
-                .groupby(source_col).size().rename("A").reset_index()
-        )
-
-    d_hist = d[d["_pay_m"] < cur_period].copy()
-    rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback(
-        d_hist, source_col, lookback, weighted
-    )
-
-    elapsed_days = (today - cur_start).days + 1
-    total_days   = (cur_end - cur_start).days + 1
-    remaining_days = max(0, total_days - elapsed_days)
-
-    src_realized = set(d_cur[source_col].fillna("Unknown").astype(str)) if not d_cur.empty else set()
-    src_hist = set(list(rates_same.keys()) + list(rates_prev.keys()))
-    all_sources = sorted(src_realized | src_hist | ({"All"} if source_col == "_Source" else set()))
-
-    A_tot = B_tot = C_tot = 0.0
-    rows = []
-    a_map = dict(zip(realized_by_src[source_col], realized_by_src["A"])) if not realized_by_src.empty else {}
-
-    for src in all_sources:
-        a_val = float(a_map.get(src, 0.0))
-        rate_same = rates_same.get(src, overall_same_rate)
-        rate_prev = rates_prev.get(src, overall_prev_rate)
-
-        b_val = float(rate_same * remaining_days)
-        c_val = float(rate_prev * remaining_days)
-
-        rows.append({
-            "Source": src,
-            "A_Actual_ToDate": a_val,
-            "B_Remaining_SameMonth": b_val,
-            "C_Remaining_PrevMonths": c_val,
-            "Projected_MonthEnd_Total": a_val + b_val + c_val,
-            "Rate_Same_Daily": rate_same,
-            "Rate_Prev_Daily": rate_prev,
-            "Remaining_Days": remaining_days
-        })
-        A_tot += a_val
-        B_tot += b_val
-        C_tot += c_val
-
-    tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
-    totals = {
-        "A_Actual_ToDate": A_tot,
-        "B_Remaining_SameMonth": B_tot,
-        "C_Remaining_PrevMonths": C_tot,
-        "Projected_MonthEnd_Total": A_tot + B_tot + C_tot,
-        "Remaining_Days": remaining_days
-    }
-    return tbl, totals
-
-
-
-def predict_chart_stacked(tbl: pd.DataFrame):
-    if tbl.empty:
-        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
-    melt = tbl.melt(
-        id_vars=["Source"],
-        value_vars=["A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths"],
-        var_name="Component",
-        value_name="Value"
-    )
-    color_map = {"A_Actual_ToDate": PALETTE["A_actual"], "B_Remaining_SameMonth": PALETTE["Rem_same"], "C_Remaining_PrevMonths": PALETTE["Rem_prev"]}
-    chart = alt.Chart(melt).mark_bar().encode(
-        x=alt.X("Source:N", sort=alt.SortField("Source")),
-        y=alt.Y("Value:Q", stack=True),
-        color=alt.Color("Component:N", scale=alt.Scale(domain=list(color_map.keys()), range=list(color_map.values())), legend=alt.Legend(title="Component", orient="top", labelLimit=240)),
-        tooltip=[alt.Tooltip("Source:N"), alt.Tooltip("Component:N"), alt.Tooltip("Value:Q", format=",.1f")]
-    ).properties(height=360, title="Predictibility (A + B + C = Projected Month-End)")
-    return chart
-
-def month_list_before(period_end: pd.Period, k: int):
-    months = []
-    p = period_end
-    for _ in range(k):
-        p = (p - 1)
-        months.append(p)
-    months.reverse()
-    return months
-
-def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
-                      lookback: int, weighted: bool, backtest_months: int, today: date):
-    if source_col is None or source_col not in df_f.columns:
-        df_work = df_f.copy()
-        source_col = "_Source"
-        df_work[source_col] = "All"
-    else:
-        df_work = df_f.copy()
-
-    d = add_month_cols(df_work, create_col, pay_col)
-    current_period = pd.Period(today, freq="M")
-
-    months_to_eval = month_list_before(current_period, backtest_months)
-    rows = []
-    for m in months_to_eval:
-        train_months = month_list_before(m, lookback)
-        d_train = d[d["_pay_m"].isin(train_months)]
-        if d_train.empty:
-            same_rates, prev_rates, same_rate_o, prev_rate_o = {}, {}, 0.0, 0.0
-        else:
-            same_rates, prev_rates, same_rate_o, prev_rate_o = daily_rates_from_lookback(
-                d_train, source_col, lookback=len(train_months), weighted=weighted
+    rows_tot, rows_src = [], []
+    for k in range(1, lookback+1):
+        ref = _shift_months(today.replace(day=1), -k)
+        s, e, dim = _month_bounds_for(ref)
+        mask = pay.between(s, e) if pay.notna().any() else pd.Series(False, index=df_f.index)
+        cnt = int(mask.sum())
+        rows_tot.append({"Month": s.strftime("%Y-%m"), "Start": s, "End": e, "Days": dim, "Enrolments": cnt})
+        if mask.any():
+            grp = (
+                pd.DataFrame({"src": src.loc[mask]})
+                .assign(_one=1)
+                .groupby("src")["_one"].sum()
+                .rename("Enrolments")
+                .reset_index()
+                .assign(Month=s.strftime("%Y-%m"))
             )
+            rows_src.append(grp)
 
-        d_m = d[d["_pay_m"] == m]
-        actual_total = int(len(d_m))
-        days_in_m = monthrange(m.year, m.month)[1]
+    hist_tot = pd.DataFrame(rows_tot) if rows_tot else pd.DataFrame(columns=["Month","Start","End","Days","Enrolments"])
+    hist_src = pd.concat(rows_src, ignore_index=True) if rows_src else pd.DataFrame(columns=["src","Enrolments","Month"])
+    return hist_tot, hist_src
 
-        sources = set(list(same_rates.keys()) + list(prev_rates.keys()))
-        if not sources and source_col != "_Source":
-            sources = set(d_m[source_col].dropna().astype(str).unique().tolist())
-        if not sources:
-            sources = {"All"}
+def _forecast_current_month(hist_tot: pd.DataFrame, today: date, weighted: bool):
+    """Return (daily_rate, proj_total, per-month details)."""
+    if hist_tot.empty:
+        return 0.0, 0, pd.DataFrame()
+    work = hist_tot.copy()
+    work["DailyRate"] = work["Enrolments"] / work["Days"].replace(0, np.nan)
+    work = work.dropna(subset=["DailyRate"])
+    if work.empty:
+        return 0.0, 0, hist_tot.assign(DailyRate=np.nan)
 
-        forecast = 0.0
-        for src in sources:
-            r_same = same_rates.get(src, same_rate_o)
-            r_prev = prev_rates.get(src, prev_rate_o)
-            forecast += (r_same + r_prev) * days_in_m
+    if weighted:
+        work = work.sort_values("Start")
+        work["w"] = range(1, len(work)+1)  # newer month -> higher weight
+        daily_rate = (work["DailyRate"] * work["w"]).sum() / work["w"].sum()
+    else:
+        daily_rate = work["DailyRate"].mean()
 
-        err = forecast - actual_total
-        rows.append({
-            "Month": str(m), "Days": days_in_m,
-            "Forecast": float(forecast), "Actual": float(actual_total),
-            "Error": float(err), "AbsError": float(abs(err)),
-            "SqError": float(err**2),
-            "APE": float(abs(err) / actual_total) if actual_total > 0 else np.nan
-        })
+    cur_start, cur_end, cur_days = _month_bounds_for(today)
+    proj_total = int(round(daily_rate * cur_days))
+    return float(daily_rate), int(proj_total), work[["Month","Enrolments","Days","DailyRate"]].sort_values("Month")
 
-    bt = pd.DataFrame(rows)
-    if bt.empty:
-        return bt, {"MAPE": np.nan, "WAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
-
-    mae = bt["AbsError"].mean()
-    rmse = (bt["SqError"].mean())**0.5
-    wape = (bt["AbsError"].sum() / bt["Actual"].sum()) if bt["Actual"].sum() > 0 else np.nan
-    mape = bt["APE"].dropna().mean() if bt["APE"].notna().any() else np.nan
-    ss_res = ((bt["Actual"] - bt["Forecast"])**2).sum()
-    ss_tot = ((bt["Actual"] - bt["Actual"].mean())**2).sum()
-    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
-    return bt, {"MAPE": mape, "WAPE": wape, "MAE": mae, "RMSE": rmse, "R2": r2}
-
-def accuracy_scatter(bt: pd.DataFrame):
-    if bt.empty:
-        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
-    chart = alt.Chart(bt).mark_circle(size=120, opacity=0.8).encode(
-        x=alt.X("Actual:Q", title="Actual (month total)"),
-        y=alt.Y("Forecast:Q", title="Forecast (start-of-month)"),
-        tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Actual:Q"), alt.Tooltip("Forecast:Q"), alt.Tooltip("Error:Q")],
-    ).properties(height=360, title="Forecast vs Actual (by month)")
-    line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],
-                                   "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
-    return chart + line
-
-# ======================
-# 80-20 (Pareto + Trajectory + Mix) helpers
-# ======================
-def build_pareto(df: pd.DataFrame, group_col: str, label: str) -> pd.DataFrame:
-    if group_col is None or group_col not in df.columns:
-        return pd.DataFrame(columns=[label, "Count", "CumCount", "CumPct", "Tag"])
-    tmp = (
-        df.assign(_grp=df[group_col].fillna("Unknown").astype(str))
-          .groupby("_grp").size().sort_values(ascending=False).rename("Count").reset_index()
-          .rename(columns={"_grp": label})
+def _pareto_abc(hist_src: pd.DataFrame):
+    """A/B/C grades by historical enrolment share (A≈top70%, B≈next20%, C≈last10%)."""
+    if hist_src.empty:
+        return pd.DataFrame(columns=["Source","Hist Enrolments","Share","CumShare","Grade"])
+    agg = (
+        hist_src.groupby("src", as_index=False)["Enrolments"].sum()
+        .rename(columns={"src":"Source","Enrolments":"Hist Enrolments"})
+        .sort_values("Hist Enrolments", ascending=False)
     )
-    if tmp.empty:
-        return tmp
-    tmp["CumCount"] = tmp["Count"].cumsum()
-    total = tmp["Count"].sum()
-    tmp["CumPct"] = (tmp["CumCount"] / total) * 100.0
-    tmp["Tag"] = np.where(tmp["CumPct"] <= 80.0, "Top 80%", "Bottom 20%")
-    return tmp
+    total = agg["Hist Enrolments"].sum()
+    if total <= 0:
+        agg["Share"] = 0.0; agg["CumShare"] = 0.0; agg["Grade"] = "C"
+        return agg
+    agg["Share"] = agg["Hist Enrolments"] / total
+    agg["CumShare"] = agg["Share"].cumsum()
+    def _g(c): 
+        if c <= 0.70: return "A"
+        if c <= 0.90: return "B"
+        return "C"
+    agg["Grade"] = agg["CumShare"].apply(_g)
+    return agg
 
-def pareto_chart(tbl: pd.DataFrame, label: str, title: str):
-    if tbl.empty:
-        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
-    base = alt.Chart(tbl).encode(x=alt.X(f"{label}:N", sort=list(tbl[label])))
-    bars = base.mark_bar(opacity=0.85).encode(
-        y=alt.Y("Count:Q", axis=alt.Axis(title="Enrollments (count)")),
-        tooltip=[alt.Tooltip(f"{label}:N"), alt.Tooltip("Count:Q")]
-    )
-    line = base.mark_line(point=True).encode(
-        y=alt.Y("CumPct:Q", axis=alt.Axis(title="Cumulative %", orient="right")),
-        color=alt.value("#16a34a"),
-        tooltip=[alt.Tooltip(f"{label}:N"), alt.Tooltip("CumPct:Q", format=".1f")]
-    )
-    rule80 = alt.Chart(pd.DataFrame({"y":[80.0]})).mark_rule(strokeDash=[4,4]).encode(y="y:Q")
-    return alt.layer(bars, line, rule80).resolve_scale(y='independent').properties(title=title, height=360)
+def _current_month_series(df_f: pd.DataFrame, pay_col: str|None, today: date):
+    """Daily cumulative enrolments for current month (up to today) & last month (full)."""
+    pay = _safe_date_series(df_f, pay_col)
+    cur_s, cur_e, cur_days = _month_bounds_for(today)
+    last_ref = _shift_months(cur_s, -1)
+    last_s, last_e, last_days = _month_bounds_for(last_ref)
 
-def months_back_list(end_d: date, k: int):
-    p_end = pd.Period(end_d, freq="M")
-    return [p_end - i for i in range(k-1, -1, -1)]
+    def _daily_series(s, e):
+        idx = pd.date_range(s, e, freq="D")
+        if pay.notna().any():
+            cnt = pd.Series(0, index=idx)
+            vc = pd.Series(1, index=pay[pay.between(s, e)].values).groupby(level=0).sum()
+            cnt.loc[vc.index] = vc.values
+        else:
+            cnt = pd.Series(0, index=idx)
+        return cnt.cumsum()
+
+    cur_cum = _daily_series(cur_s, today)  # to today
+    last_cum = _daily_series(last_s, last_e)
+    return cur_s, cur_e, cur_days, cur_cum, last_s, last_e, last_days, last_cum
 
 # ======================
 # RENDER: Views
@@ -899,131 +745,125 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 
-# ===== FIXED + ROBUST: helper used by Predictability tab =====
-def predict_running_month(
-    df_scope: pd.DataFrame,
-    create_col: str | None,
-    pay_col: str | None,
-    source_col: str | None,
-    lookback: int,
-    weighted: bool,
-    today: date,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-
-    if df_scope is None or df_scope.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Safe date series from full frame
-    _c = coerce_datetime(df_scope[create_col]).dt.date if (create_col and create_col in df_scope.columns) else pd.Series(pd.NaT, index=df_scope.index)
-    _p = coerce_datetime(df_scope[pay_col]).dt.date    if (pay_col    and pay_col    in df_scope.columns) else pd.Series(pd.NaT, index=df_scope.index)
-
-    # Running-month bounds (MTD up to 'today')
-    m_start, _m_end_full = month_bounds(today)
-    m_end_mtd = today
-
-    # In-month flags
-    m_created = _c.between(m_start, m_end_mtd) if _c.notna().any() else pd.Series(False, index=df_scope.index)
-    m_paid    = _p.between(m_start, m_end_mtd) if _p.notna().any() else pd.Series(False, index=df_scope.index)
-
-    # Keep rows that have either activity this month
-    idx_any = (m_created | m_paid)
-    d_cur = df_scope.loc[idx_any].copy()
-
-    # ---- SAFE source column (fixes your crash) ----
-    _safe_src_col = source_col if (source_col and source_col in d_cur.columns) else "_SourceSafe"
-    if _safe_src_col not in d_cur.columns:
-        d_cur[_safe_src_col] = "Unknown"
-    d_cur[_safe_src_col] = d_cur[_safe_src_col].fillna("Unknown").astype(str).str.strip()
-
-    # Align date series to the sliced frame
-    _c_cur = coerce_datetime(d_cur[create_col]).dt.date if (create_col and create_col in d_cur.columns) else pd.Series(pd.NaT, index=d_cur.index)
-    _p_cur = coerce_datetime(d_cur[pay_col]).dt.date    if (pay_col    and pay_col    in d_cur.columns) else pd.Series(pd.NaT, index=d_cur.index)
-
-    m_created_cur = _c_cur.between(m_start, m_end_mtd) if _c_cur.notna().any() else pd.Series(False, index=d_cur.index)
-    m_paid_cur    = _p_cur.between(m_start, m_end_mtd) if _p_cur.notna().any() else pd.Series(False, index=d_cur.index)
-
-    # Aggregations by source
-    g = d_cur.groupby(_safe_src_col, dropna=False)
-    created_by_src = g.apply(lambda x: int(m_created_cur.loc[x.index].sum())).rename("Created MTD")
-    paid_by_src    = g.apply(lambda x: int(m_paid_cur.loc[x.index].sum())).rename("Enrolments MTD")
-    cr_by_src      = (paid_by_src / created_by_src.replace(0, np.nan)).fillna(0.0).rename("CR (Enrol/Created)")
-
-    tbl = (
-        pd.concat([created_by_src, paid_by_src, cr_by_src], axis=1)
-          .reset_index()
-          .rename(columns={_safe_src_col: (source_col or "JetLearn Deal Source")})
-          .sort_values("Created MTD", ascending=False)
-    )
-
-    totals = pd.DataFrame({
-        "Created MTD (total)": [int(m_created_cur.sum())],
-        "Enrolments MTD (total)": [int(m_paid_cur.sum())],
-        "CR Total (Enrol/Created)": [float(int(m_paid_cur.sum()) / int(m_created_cur.sum())) if int(m_created_cur.sum()) > 0 else 0.0],
-        "Month": [m_start.strftime("%Y-%m")]
-    })
-
-    # (Optional) You can add forecast columns here using lookback/weighted if needed.
-
-    return tbl, totals
-
-
-# ===== TAB: Predictability =====
-# --- Predictability tab ---
-if view == "Predictability":
-    st.subheader("Predictability")
+# ======================
+# TAB: Predictibility (uses lookback, A/B/C, & chart) — KEEPING ALL ELSE INTACT
+# ======================
+if view == "Predictibility":
+    st.subheader("Predictibility")
 
     # Controls
     col_p1, col_p2, col_p3 = st.columns([1,1,1])
     with col_p1:
-        lookback = st.number_input("Lookback months (for forecast)", min_value=0, max_value=12, value=3, step=1, key="pred_lb")
+        lookback = st.number_input("Lookback months", min_value=1, max_value=12, value=3, step=1, key="pred_lb")
     with col_p2:
         weighted = st.checkbox("Weighted by recency", value=True, key="pred_wt")
     with col_p3:
         show_by_source = st.checkbox("Show by JetLearn Deal Source", value=True, key="pred_by_src")
 
-    # Compute
-    tbl, totals = predict_running_month(
-        df_scope=df_f,
-        create_col=create_col,
-        pay_col=pay_col,
-        source_col=source_col,
-        lookback=int(lookback),
-        weighted=bool(weighted),
-        today=today,
-    )
+    # Build history & forecast
+    hist_tot, hist_src = _build_history(df_f, pay_col, source_col, today, int(lookback))
+    daily_rate, proj_total, hist_details = _forecast_current_month(hist_tot, today, bool(weighted))
 
-    # Output
-    if tbl.empty and totals.empty:
-        st.info("No data for the running month.")
+    # Current month status
+    cur_s, cur_e, cur_days = _month_bounds_for(today)
+    pay_now = _safe_date_series(df_f, pay_col)
+    created_now = _safe_date_series(df_f, create_col)
+    mtd_paid = int(pay_now.between(cur_s, today).sum()) if pay_now.notna().any() else 0
+    mtd_created = int(created_now.between(cur_s, today).sum()) if created_now.notna().any() else 0
+    days_done = (today - cur_s).days + 1
+    progress = days_done / cur_days if cur_days else 0.0
+    proj_line_today = int(round(proj_total * progress)) if proj_total else 0
+
+    # Header KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Created (MTD)", mtd_created)
+    with c2: st.metric("Enrolments (MTD)", mtd_paid)
+    with c3: st.metric("Forecast (EOM Enrolments)", proj_total)
+    with c4: st.metric("Avg Daily Enrolments", f"{daily_rate:.2f}")
+
+    # By-source (MTD)
+    if show_by_source:
+        if source_col and source_col in df_f.columns:
+            src_series = df_f[source_col].fillna("Unknown").astype(str).str.strip()
+        else:
+            src_series = pd.Series("All", index=df_f.index)
+        m_mask = pay_now.between(cur_s, today) if pay_now.notna().any() else pd.Series(False, index=df_f.index)
+        if m_mask.any():
+            by_src = (
+                pd.DataFrame({"Source": src_series.loc[m_mask]})
+                .assign(Enrolments=1)
+                .groupby("Source", as_index=False)["Enrolments"].sum()
+                .sort_values("Enrolments", ascending=False)
+            )
+        else:
+            by_src = pd.DataFrame(columns=["Source","Enrolments"])
+        st.markdown("### Running Month — By Source (Enrolments MTD)")
+        st.dataframe(by_src, use_container_width=True)
+        st.download_button("Download CSV — By Source (MTD)",
+                           data=by_src.to_csv(index=False).encode("utf-8"),
+                           file_name="predictibility_by_source_mtd.csv",
+                           mime="text/csv",
+                           key="pred_src_mtd_dl")
+
+    # A/B/C grading from lookback history
+    abc = _pareto_abc(hist_src)
+    st.markdown("### Source Grading (A/B/C) — Historical share (lookback)")
+    st.dataframe(abc, use_container_width=True)
+    st.download_button("Download CSV — Source Grades (history)",
+                       data=abc.to_csv(index=False).encode("utf-8"),
+                       file_name="predictibility_source_grades.csv",
+                       mime="text/csv",
+                       key="pred_abc_dl")
+
+    # Lookback month details (daily rates)
+    if not hist_details.empty:
+        st.markdown("#### Lookback Months — Daily rates")
+        st.dataframe(hist_details, use_container_width=True)
+
+    # Chart: cumulative enrolments (current vs last) + forecast trajectory
+    st.markdown("### Enrolments — Daily cumulative (Current vs Last month)")
+    cur_s2, cur_e2, cur_days2, cur_cum, last_s, last_e, last_days, last_cum = _current_month_series(df_f, pay_col, today)
+
+    if not cur_cum.empty:
+        df_cur = cur_cum.reset_index(); df_cur.columns = ["Date","Cumulative"]; df_cur["Series"] = "This month"
+        df_last = last_cum.reset_index(); df_last.columns = ["Date","Cumulative"]; df_last["Series"] = "Last month"
+
+        # Forecast straight-line to month-end
+        traj_dates = pd.date_range(cur_s2, cur_e2, freq="D")
+        traj_vals = np.linspace(0, proj_total, len(traj_dates))
+        df_traj = pd.DataFrame({"Date": traj_dates, "Cumulative": traj_vals, "Series":"Forecast (linear)"})
+
+        chart_df = pd.concat([df_cur, df_last, df_traj], ignore_index=True)
+        chart = (
+            alt.Chart(chart_df)
+            .mark_line(point=False)
+            .encode(
+                x=alt.X("Date:T", title="Date"),
+                y=alt.Y("Cumulative:Q", title="Cumulative enrolments"),
+                color=alt.Color("Series:N", title="", legend=alt.Legend(orient="bottom")),
+                tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Series:N"), alt.Tooltip("Cumulative:Q")]
+            )
+            .properties(height=360)
+        )
+        st.altair_chart(chart, use_container_width=True)
+        st.caption(f"Forecast to month-end: **{proj_total}** enrolments • Expected by today (linear): **{proj_line_today}**")
     else:
-        if show_by_source and not tbl.empty:
-            st.markdown("### Running Month — By Source")
-            st.dataframe(tbl, use_container_width=True)
-            st.download_button(
-                "Download CSV — Predictability (by source)",
-                data=tbl.to_csv(index=False).encode("utf-8"),
-                file_name="predictability_by_source.csv",
-                mime="text/csv",
-                key="pred_src_dl",
-            )
+        st.info("No enrolments recorded this month yet, so the chart is empty.")
 
-        if not totals.empty:
-            st.markdown("### Running Month — Totals")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric("Created (MTD)", int(totals.iloc[0]["Created MTD (total)"]))
-            with c2:
-                st.metric("Enrolments (MTD)", int(totals.iloc[0]["Enrolments MTD (total)"]))
-            with c3:
-                st.metric("CR Total", f"{float(totals.iloc[0]['CR Total (Enrol/Created)']):.2%}")
+    # Totals download
+    totals = pd.DataFrame({
+        "Created MTD": [mtd_created],
+        "Enrolments MTD": [mtd_paid],
+        "Avg Daily (lookback)": [daily_rate],
+        "Forecast EOM": [proj_total],
+        "Month": [cur_s.strftime('%Y-%m')]
+    })
+    st.download_button("Download CSV — Predictibility (totals)",
+                       data=totals.to_csv(index=False).encode("utf-8"),
+                       file_name="predictibility_totals.csv",
+                       mime="text/csv",
+                       key="pred_totals_dl")
 
-            st.download_button(
-                "Download CSV — Predictability (totals)",
-                data=totals.to_csv(index=False).encode("utf-8"),
-                file_name="predictability_totals.csv",
-                mime="text/csv",
-                key="pred_totals_dl",
-            )
 
 
 elif view == "Trend & Analysis":
