@@ -1122,28 +1122,38 @@ elif view == "Trend & Analysis":
             ("This Month", _tm_start, _tm_end_mtd),  # MTD up to today
         ]
 
+        # ---- UPDATED: function includes the 2 new conversion metrics ----
         def _kpi_for_window(start_d, end_d):
             # Base masks by window
             _created_in_win = _between_dates(_create_dt, start_d, end_d)
             _paid_in_win    = _between_dates(_pay_dt,    start_d, end_d)
 
-            # Enrolments logic
+            # Base paid mask per mode
             if level == "MTD":
-                # Payments in window AND deals created in the SAME window
-                _enrol = int((_paid_in_win & _created_in_win).sum())
+                # Payments in window among deals CREATED in the same window
+                _paid_mask = (_paid_in_win & _created_in_win)
             else:
                 # Cohort: payments in window irrespective of Create Date
-                _enrol = int(_paid_in_win.sum())
+                _paid_mask = _paid_in_win
 
-            # Referral-created & Self-gen (by Create Date window)
+            # Core KPIs
+            _enrol = int(_paid_mask.sum())
+
+            # Created-by-window metrics
             _ref_created = (_created_in_win & _is_referral)
-            _self_gen    = (_ref_created & _is_sales_generated)
+            _self_created = (_ref_created & _is_sales_generated)
+
+            # NEW: conversion KPIs (by payment date window, using paid mask)
+            _referral_conv     = int((_paid_mask & _is_referral).sum())
+            _selfgen_ref_conv  = int((_paid_mask & _is_sales_generated).sum())
 
             return {
                 "Deals Created": int(_created_in_win.sum()),
                 "Enrolments": _enrol,
                 "Referrals (Created)": int(_ref_created.sum()),
-                "Self-Gen Referrals": int(_self_gen.sum()),
+                "Self-Gen Referrals": int(_self_created.sum()),
+                "Referral Conversion": _referral_conv,
+                "Self-Gen Referral Conversion": _selfgen_ref_conv,
             }
 
         # Render 4 KPI cards
@@ -1164,8 +1174,14 @@ elif view == "Trend & Analysis":
                       <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
                         <span>Referrals (Created)</span><span><strong>{_m['Referrals (Created)']}</strong></span>
                       </div>
-                      <div style="display:flex; justify-content:space-between;">
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
                         <span>Self-Gen Referrals</span><span><strong>{_m['Self-Gen Referrals']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                        <span>Referral Conversion</span><span><strong>{_m['Referral Conversion']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between;">
+                        <span>Self-Gen Referral Conversion</span><span><strong>{_m['Self-Gen Referral Conversion']}</strong></span>
                       </div>
                     </div>
                     """,
@@ -1382,7 +1398,6 @@ elif view == "Trend & Analysis":
         elif sort_metric_ref == "A–Z":
             grp = grp.sort_values("Referral Intent Source", ascending=True)
         else:
-            grp = grp.sort_values("Created", descending=False)  # NOTE: correcting ascending to descending
             grp = grp.sort_values("Created", ascending=False)
 
         grp_show = grp.head(int(top_k_ref)) if len(grp) > int(top_k_ref) else grp
