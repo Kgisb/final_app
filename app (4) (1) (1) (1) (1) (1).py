@@ -616,9 +616,11 @@ def _rates_by_lag(d_hist: pd.DataFrame, create_col: str, pay_col: str, lookback:
     return rates
 
 def _actual_to_date(df_scope: pd.DataFrame, pay_col: str, today: date) -> int:
-    m_start, _m_end = _month_bounds_for(today)
+    # returns actual enrolments recorded this month up to 'today'
+    m_start, _m_end, _ = _month_bounds_for(today)  # ← note the third ignored value
     p = _safe_date_series(df_scope, pay_col)
     return int(p.between(m_start, today).sum())
+
 
 def forecast_components(
     df_scope: pd.DataFrame,
