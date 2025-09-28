@@ -1222,6 +1222,69 @@ elif view == "Trend & Analysis":
                     unsafe_allow_html=True,
                 )
 
+    # -------------------------------
+    # EXTRA: Optional custom range box
+    # -------------------------------
+    with st.container():
+        st.markdown("### Additional Range (optional)")
+
+        col_x1, col_x2 = st.columns(2)
+        with col_x1:
+            extra_start = st.date_input(
+                "Additional range — Start",
+                value=range_start,  # default to the scope above
+                key="ta_extra_start",
+            )
+        with col_x2:
+            extra_end = st.date_input(
+                "Additional range — End",
+                value=range_end,  # default to the scope above
+                key="ta_extra_end",
+            )
+
+        if extra_end < extra_start:
+            st.warning("Additional range: End date cannot be before start date.", icon="⚠️")
+        else:
+            extra_metrics = _kpi_for_window(extra_start, extra_end)
+
+            # Render one more KPI card with ALL the details
+            st.markdown(f"**Selected Range**  \n({extra_start} → {extra_end})")
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e5e7eb; border-radius:12px; padding:10px; background:#ffffff;">
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Deals Created</span><span><strong>{extra_metrics['Deals Created']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Enrolments</span><span><strong>{extra_metrics['Enrolments']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Referrals (Created)</span><span><strong>{extra_metrics['Referrals (Created)']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Self-Gen Referrals</span><span><strong>{extra_metrics['Self-Gen Referrals']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Referral Conversion</span><span><strong>{extra_metrics['Referral Conversion']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Self-Gen Referral Conversion</span><span><strong>{extra_metrics['Self-Gen Referral Conversion']}</strong></span>
+                  </div>
+                  <hr style="border:none;border-top:1px solid #eee;margin:8px 0;">
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>First Calibration</span><span><strong>{extra_metrics['First Calibration']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span>Rescheduled Calibration</span><span><strong>{extra_metrics['Rescheduled Calibration']}</strong></span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between;">
+                    <span>Calibration Done</span><span><strong>{extra_metrics['Calibration Done']}</strong></span>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
     # Metric picker (includes derived)
     all_metrics = [
         "Payment Received Date — Count",
