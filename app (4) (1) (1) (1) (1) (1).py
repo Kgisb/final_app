@@ -1,5 +1,3 @@
-# app.py — JetLearn: MIS + Predictibility + Trend & Analysis + 80-20 (Merged, de-conflicted)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -744,533 +742,125 @@ if view == "MIS":
                                               create_col=create_col, pay_col=pay_col)
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
-# ======================
-# Predictibility (cohort-aware A/B/C logic w/ source+country)
-# ======================
-
-def _safe_cat(series, fallback="Unknown"):
-    if series is None:
-        return pd.Series(fallback, index=df_f.index)
-    return series.fillna(fallback).astype(str).str.strip()
-
-def _period(dt: pd.Timestamp | date) -> pd.Period:
-    return pd.Period(pd.Timestamp(dt), freq="M")
-
-def _ym(d: date) -> str:
-    return f"{d.year:04d}-{d.month:02d}"
-
-def _days_in_month(p: pd.Period) -> int:
-    return monthrange(p.year, p.month)[1]
-
-def _blend(rate_key, n_key, rate_parent, k=20.0):
-    """Empirical Bayes style blending for sparse keys."""
-    if pd.isna(rate_key): rate_key = 0.0
-    if pd.isna(rate_parent): rate_parent = 0.0
-    w = float(n_key) / (float(n_key) + float(k))
-    return (w * rate_key) + ((1.0 - w) * rate_parent)
-
-def _lag_months(cdate: pd.Timestamp, pdate: pd.Timestamp) -> int:
-    if pd.isna(cdate) or pd.isna(pdate):
-        return np.nan
-    cp, pp = cdate.to_period("M"), pdate.to_period("M")
-    return (pp.year - cp.year) * 12 + (pp.month - cp.month)
-
-def _extract_keyframe(df_scope: pd.DataFrame,
-                      create_col: str, pay_col: str,
-                      source_col: str | None, country_col: str | None):
-    d = df_scope.copy()
-    d["_create_ts"] = coerce_datetime(d[create_col])
-    d["_pay_ts"]    = coerce_datetime(d[pay_col])
-    d["_create_m"]  = d["_create_ts"].dt.to_period("M")
-    d["_pay_m"]     = d["_pay_ts"].dt.to_period("M")
-    d["_lag_m"]     = d.apply(lambda r: _lag_months(r["_create_ts"], r["_pay_ts"]), axis=1)
-
-    src = _safe_cat(d[source_col]) if (source_col and source_col in d.columns) else pd.Series("All", index=d.index)
-    ctr = _safe_cat(d[country_col]) if (country_col and country_col in d.columns) else pd.Series("All", index=d.index)
-    d["_key_src"] = src
-    d["_key_ctr"] = ctr
-    d["_key"]     = d["_key_src"] + " | " + d["_key_ctr"]
-    return d
-
-def _build_history_windows(today: date, months_back: int):
-    """Return [last `months_back` full months], newest last."""
-    base = date(today.year, today.month, 1)
-    out = []
-    for i in range(1, months_back + 1):
-        ref = base - pd.DateOffset(months=i)
-        p = pd.Period(ref, freq="M")
-        out.append(p)
-    return list(reversed(out))
-
-def _learn_same_month_conv(d_hist: pd.DataFrame, hist_months: list[pd.Period]):
-    """Per key: same-month conversion rate and supporting counts."""
-    if d_hist.empty:
-        return pd.DataFrame(columns=["Key","rate_sm","n_create"])
-    sub = d_hist[d_hist["_create_m"].isin(hist_months)]
-    if sub.empty:
-        return pd.DataFrame(columns=["Key","rate_sm","n_create"])
-
-    # creates per key per month
-    creates = (sub.groupby(["_key","_create_m"]).size()
-                  .rename("creates").reset_index())
-
-    # same-month payments per key per month
-    sm_mask = sub["_create_m"] == sub["_pay_m"]
-    sm_pays = (sub.loc[sm_mask].groupby(["_key","_create_m"]).size()
-                  .rename("sm_pay").reset_index())
-
-    comb = creates.merge(sm_pays, on=["_key","_create_m"], how="left").fillna(0)
-    comb["rate_m"] = np.where(comb["creates"]>0, comb["sm_pay"]/comb["creates"], np.nan)
-
-    by_key = comb.groupby("_key").agg(
-        rate_sm=("rate_m", "mean"),      # unweighted mean across months
-        n_create=("creates", "sum")
-    ).reset_index().rename(columns={"_key":"Key"})
-    return by_key
-
-def _learn_lag_daily_rates(d_hist: pd.DataFrame, hist_months: list[pd.Period]):
-    """Per key: average DAILY payments in pay-month attributable to lag=0, lag=1, lag>=2."""
-    if d_hist.empty:
-        return pd.DataFrame(columns=["Key","dr_lag0","dr_lag1","dr_lag2p","n_pay"])
-    sub = d_hist[d_hist["_pay_m"].isin(hist_months)]
-    if sub.empty:
-        return pd.DataFrame(columns=["Key","dr_lag0","dr_lag1","dr_lag2p","n_pay"])
-
-    # bucket lags
-    sub = sub.copy()
-    sub["_lag_bucket"] = np.where(sub["_lag_m"]==0, "lag0",
-                           np.where(sub["_lag_m"]==1, "lag1",
-                             "lag2p"))
-
-    # counts by key, pay_month, bucket
-    cnt = (sub.groupby(["_key","_pay_m","_lag_bucket"]).size()
-              .rename("cnt").reset_index())
-
-    # days in each pay month
-    cnt["days"] = cnt["_pay_m"].apply(_days_in_month)
-
-    # daily rate per bucket per month
-    cnt["dr"] = cnt["cnt"] / cnt["days"]
-
-    # mean daily rate across months per key & bucket
-    m = (cnt.groupby(["_key","_lag_bucket"])["dr"].mean()
-            .rename("dr_mean").reset_index())
-
-    # pivot to columns
-    piv = m.pivot(index="_key", columns="_lag_bucket", values="dr_mean").reset_index().fillna(0)
-    piv = piv.rename(columns={"_key":"Key", "lag0":"dr_lag0", "lag1":"dr_lag1", "lag2p":"dr_lag2p"})
-
-    # support n
-    n_pay = sub.groupby("_key").size().rename("n_pay").reset_index()
-    out = piv.merge(n_pay, on="Key", how="left")
-    return out
-
-def _learn_create_daily_rate(d_hist: pd.DataFrame, today: date, create_lookback_days: int):
-    """Per key: average daily creates over last N days (rolling)."""
-    if d_hist.empty or create_lookback_days <= 0:
-        return pd.DataFrame(columns=["Key","dr_create","n_days"])
-    end = pd.Timestamp(today)
-    start = end - pd.Timedelta(days=create_lookback_days-1)
-    mask = d_hist["_create_ts"].between(start, end)
-    sub  = d_hist.loc[mask].copy()
-    if sub.empty:
-        return pd.DataFrame(columns=["Key","dr_create","n_days"])
-    # by key counts per day
-    sub["_day"] = sub["_create_ts"].dt.date
-    grp = (sub.groupby(["_key","_day"]).size().rename("cnt").reset_index())
-    by_key = grp.groupby("_key")["cnt"].mean().rename("dr_create").reset_index()
-    by_key["n_days"] = create_lookback_days
-    by_key = by_key.rename(columns={"_key":"Key"})
-    return by_key
-
-def _learn_all_rates(df_scope: pd.DataFrame,
-                     create_col: str, pay_col: str,
-                     source_col: str | None, country_col: str | None,
-                     today: date, hist_months_back: int, create_lookback_days: int):
-    """Return per-key rates with hierarchical smoothing + global fallback."""
-    d = _extract_keyframe(df_scope, create_col, pay_col, source_col, country_col)
-
-    # windows
-    hist_months = _build_history_windows(today, hist_months_back)
-
-    # base tables
-    sm   = _learn_same_month_conv(d, hist_months)         # rate_sm, n_create
-    lag  = _learn_lag_daily_rates(d, hist_months)         # dr_lag0,1,2p, n_pay
-    crea = _learn_create_daily_rate(d, today, create_lookback_days)  # dr_create
-
-    # join
-    rates = pd.merge(pd.merge(sm, lag, on="Key", how="outer"), crea, on="Key", how="outer").fillna(0)
-
-    # build parent aggregates for smoothing
-    # Parent 1: by Source only
-    d["_src_only"] = d["_key_src"]
-    d["_ctr_only"] = d["_key_ctr"]
-
-    def _agg_parent(level_col, label):
-        # recompute rates at parent level
-        d2 = d.copy()
-        d2["_key"] = d2[level_col]
-
-        sm_p   = _learn_same_month_conv(d2, hist_months).rename(columns={"Key":"PKey","rate_sm":f"p_{label}_rate_sm","n_create":f"p_{label}_n_create"})
-        lag_p  = _learn_lag_daily_rates(d2, hist_months).rename(columns={"Key":"PKey",
-                                                                          "dr_lag0":f"p_{label}_dr_lag0",
-                                                                          "dr_lag1":f"p_{label}_dr_lag1",
-                                                                          "dr_lag2p":f"p_{label}_dr_lag2p",
-                                                                          "n_pay":f"p_{label}_n_pay"})
-        crea_p = _learn_create_daily_rate(d2, today, create_lookback_days).rename(columns={"Key":"PKey","dr_create":f"p_{label}_dr_create","n_days":f"p_{label}_n_days"})
-        return sm_p, lag_p, crea_p
-
-    # make maps for key -> parents
-    key_to_src = d.drop_duplicates("_key")["_key"].to_list()
-    key_src_df = d.drop_duplicates(["_key","_key_src"])[["_key","_key_src"]].rename(columns={"_key":"Key","_key_src":"P_src"})
-    key_ctr_df = d.drop_duplicates(["_key","_key_ctr"])[["_key","_key_ctr"]].rename(columns={"_key":"Key","_key_ctr":"P_ctr"})
-
-    sm_src, lag_src, crea_src = _agg_parent("_src_only", "src")
-    sm_ctr, lag_ctr, crea_ctr = _agg_parent("_ctr_only", "ctr")
-
-    # global parent
-    d_glob = d.copy(); d_glob["_key"] = "ALL"
-    sm_g   = _learn_same_month_conv(d_glob, hist_months).rename(columns={"Key":"G","rate_sm":"g_rate_sm","n_create":"g_n_create"})
-    lag_g  = _learn_lag_daily_rates(d_glob, hist_months).rename(columns={"Key":"G","dr_lag0":"g_dr_lag0","dr_lag1":"g_dr_lag1","dr_lag2p":"g_dr_lag2p","n_pay":"g_n_pay"})
-    crea_g = _learn_create_daily_rate(d_glob, today, create_lookback_days).rename(columns={"Key":"G","dr_create":"g_dr_create","n_days":"g_n_days"})
-
-    # attach parents
-    rates = rates.merge(key_src_df, on="Key", how="left").merge(key_ctr_df, on="Key", how="left")
-    # source parent numbers
-    rates = (rates
-        .merge(sm_src.rename(columns={"PKey":"P_src"}), on="P_src", how="left")
-        .merge(lag_src.rename(columns={"PKey":"P_src"}), on="P_src", how="left")
-        .merge(crea_src.rename(columns={"PKey":"P_src"}), on="P_src", how="left"))
-    # country parent numbers
-    rates = (rates
-        .merge(sm_ctr.rename(columns={"PKey":"P_ctr"}), on="P_ctr", how="left")
-        .merge(lag_ctr.rename(columns={"PKey":"P_ctr"}), on="P_ctr", how="left")
-        .merge(crea_ctr.rename(columns={"PKey":"P_ctr"}), on="P_ctr", how="left"))
-    # global
-    rates["G"] = "ALL"
-    rates = (rates
-        .merge(sm_g, on="G", how="left")
-        .merge(lag_g, on="G", how="left")
-        .merge(crea_g, on="G", how="left"))
-
-    # smooth/blend (key with src-parent, then with ctr-parent, then with global)
-    def _b3(x, rk, nk, rp, np_, rg, ng):
-        v1 = _blend(x[rk], x[nk], x[rp], k=max(10.0, (np_ or 0)))
-        v2 = _blend(v1, x[nk], x[rg], k=max(30.0, (ng or 0)))
-        return v2
-
-    out = []
-    for _, r in rates.iterrows():
-        sm_bl  = _b3(r, "rate_sm", "n_create", "p_src_rate_sm", r.get("p_src_n_create",0), "g_rate_sm", r.get("g_n_create",0))
-        lag0_b = _b3(r, "dr_lag0", "n_pay",   "p_src_dr_lag0", r.get("p_src_n_pay",0),  "g_dr_lag0", r.get("g_n_pay",0))
-        lag1_b = _b3(r, "dr_lag1", "n_pay",   "p_src_dr_lag1", r.get("p_src_n_pay",0),  "g_dr_lag1", r.get("g_n_pay",0))
-        lag2_b = _b3(r, "dr_lag2p","n_pay",   "p_src_dr_lag2p",r.get("p_src_n_pay",0),  "g_dr_lag2p",r.get("g_n_pay",0))
-        cr_b   = _b3(r, "dr_create","n_days", "p_src_dr_create",r.get("p_src_n_days",0),"g_dr_create",r.get("g_n_days",0))
-        out.append([r["Key"], sm_bl, lag0_b, lag1_b, lag2_b, cr_b])
-    rates_blend = pd.DataFrame(out, columns=["Key","rate_sm","dr_lag0","dr_lag1","dr_lag2p","dr_create"])
-    return rates_blend
-
-def forecast_components(df_scope: pd.DataFrame,
-                        create_col: str, pay_col: str,
-                        source_col: str | None, country_col: str | None,
-                        today: date,
-                        hist_months_back: int = 6,
-                        create_lookback_days: int = 90,
-                        activity_weight: bool = True,
-                        activity_days: int = 7,
-                        last_connected_col: str | None = None,
-                        last_activity_col: str | None = None):
-    """Return (components_df, rates_df). Components has A,B1,B2,C1,C2p and totals per key."""
-    if df_scope.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # learn rates
-    rates = _learn_all_rates(
-        df_scope, create_col, pay_col, source_col, country_col,
-        today, hist_months_back, create_lookback_days
-    )
-    # keyframe
-    d = _extract_keyframe(df_scope, create_col, pay_col, source_col, country_col)
-
-    # current month boundaries
-    cur_start, cur_end = month_bounds(today)
-    remaining_days = (cur_end - today).days
-    if remaining_days < 0:
-        remaining_days = 0
-
-    # actuals so far (A) per key
-    pay_msk = d["_pay_ts"].dt.date.between(cur_start, today)
-    A_by_key = d.loc[pay_msk].groupby("_key").size().rename("A").reset_index()
-
-    # same-month counts so far (for B1 correction)
-    sm_now = d.loc[pay_msk & (d["_create_m"] == d["_pay_m"])].groupby("_key").size().rename("sm_paid_sofar").reset_index()
-
-    # creates so far this month
-    cr_msk = d["_create_ts"].dt.date.between(cur_start, today)
-    CR_by_key = d.loc[cr_msk].groupby("_key").size().rename("creates_sofar").reset_index()
-
-    # expected remaining creates (B2 driver)
-    rates_key = rates.rename(columns={"Key":"_key"})
-    # join working frame
-    wk = (pd.merge(pd.merge(A_by_key, CR_by_key, on="_key", how="outer"),
-                   sm_now, on="_key", how="outer")
-            .merge(rates_key, on="_key", how="outer")).fillna(0)
-
-    wk["B1"] = np.maximum(0, wk["rate_sm"] * wk["creates_sofar"] - wk["sm_paid_sofar"])
-    wk["B2"] = wk["rate_sm"] * (wk["dr_create"] * remaining_days)
-
-    # lag contributions (C1, C2p) per key: daily rates * remaining days
-    # Optional activity uplift for older cohorts
-    uplift = 1.0
-    if activity_weight and (last_connected_col in df_scope.columns or last_activity_col in df_scope.columns):
-        # share of older deals (created before current month) with recent activity
-        lc = coerce_datetime(df_scope.get(last_connected_col)) if last_connected_col in df_scope.columns else pd.Series(pd.NaT, index=df_scope.index)
-        la = coerce_datetime(df_scope.get(last_activity_col)) if last_activity_col in df_scope.columns else pd.Series(pd.NaT, index=df_scope.index)
-        act = lc.combine_first(la)
-        recent = act.dt.date >= (today - timedelta(days=activity_days))
-        older = coerce_datetime(df_scope[create_col]).dt.date < cur_start
-        denom = int((older).sum())
-        numer = int((older & recent).sum())
-        share = (numer/denom) if denom>0 else 0.0
-        uplift = 1.0 + 0.2 * share  # small, bounded uplift
-
-    wk["C1"]   = wk["dr_lag1"]  * remaining_days * uplift
-    wk["C2p"]  = wk["dr_lag2p"] * remaining_days * uplift
-    wk["A"]    = wk["A"].astype(float)
-    wk["TotalProjected"] = wk["A"] + wk["B1"] + wk["B2"] + wk["C1"] + wk["C2p"]
-
-    # pretty key split
-    if source_col and country_col:
-        spl = wk["_key"].str.split(" \| ", n=1, expand=True)
-        wk["Source"]  = spl[0]; wk["Country"] = spl[1]
-    else:
-        wk["Source"]  = wk["_key"]; wk["Country"] = "All"
-
-    cols = ["Source","Country","A","B1","B2","C1","C2p","TotalProjected","rate_sm","dr_create","dr_lag0","dr_lag1","dr_lag2p"]
-    wk = wk[cols].sort_values(["Source","Country"]).reset_index(drop=True)
-    return wk, rates
-
-def backtest_predictibility(df_scope: pd.DataFrame,
-                            create_col: str, pay_col: str,
-                            source_col: str | None, country_col: str | None,
-                            months_back_test: int = 6,
-                            hist_months_back: int = 6,
-                            create_lookback_days: int = 90):
-    """Freeze the model at start of each of the last M months and compare to actual."""
-    if df_scope.empty: 
-        return pd.DataFrame(), {"MAPE":np.nan,"WAPE":np.nan,"MAE":np.nan,"RMSE":np.nan,"R2":np.nan}
-
-    d0 = _extract_keyframe(df_scope, create_col, pay_col, source_col, country_col)
-    today0 = date.today()
-    test_months = _build_history_windows(today0, months_back_test)
-
-    rows = []
-    for p in test_months:
-        anchor = date(p.year, p.month, 1)
-        # learn rates using data strictly before this month
-        d_train = d0[(d0["_pay_m"] < p) | (d0["_pay_m"].isna())].copy()
-        comps, _ = forecast_components(
-            df_scope=d_train, create_col=create_col, pay_col=pay_col,
-            source_col=source_col, country_col=country_col,
-            today=anchor, hist_months_back=hist_months_back,
-            create_lookback_days=create_lookback_days,
-            activity_weight=False  # backtest neutral uplift
-        )
-        forecast = comps["TotalProjected"].sum()
-
-        # actual of that month (full)
-        act = int((d0["_pay_m"] == p).sum())
-        err = forecast - act
-        rows.append({"Month": str(p), "Forecast": float(forecast), "Actual": float(act),
-                     "Error": float(err), "AbsError": float(abs(err)), "SqError": float(err**2),
-                     "APE": (abs(err)/act) if act>0 else np.nan})
-    bt = pd.DataFrame(rows)
-    if bt.empty:
-        return bt, {"MAPE":np.nan,"WAPE":np.nan,"MAE":np.nan,"RMSE":np.nan,"R2":np.nan}
-
-    mae = bt["AbsError"].mean()
-    rmse = (bt["SqError"].mean())**0.5
-    wape = bt["AbsError"].sum()/bt["Actual"].sum() if bt["Actual"].sum()>0 else np.nan
-    mape = bt["APE"].dropna().mean() if bt["APE"].notna().any() else np.nan
-    ss_res = ((bt["Actual"] - bt["Forecast"])**2).sum()
-    ss_tot = ((bt["Actual"] - bt["Actual"].mean())**2).sum()
-    r2 = 1 - ss_res/ss_tot if ss_tot>0 else np.nan
-    return bt, {"MAPE":mape, "WAPE":wape, "MAE":mae, "RMSE":rmse, "R2":r2}
 
 # ======================
-# TAB: Predictibility — Cohort-aware A/B/C forecast (keep other tabs intact)
+# TAB: Predictibility (uses lookback, A/B/C, & chart) — KEEPING ALL ELSE INTACT
 # ======================
 if view == "Predictibility":
     st.subheader("Predictibility")
 
-    # Controls (logic only; UI intact)
+    # Controls
     col_p1, col_p2, col_p3 = st.columns([1,1,1])
     with col_p1:
-        hist_months_back = st.number_input("Lookback months (lags)", min_value=3, max_value=12, value=6, step=1, key="pred_hist_mo")
+        lookback = st.number_input("Lookback months", min_value=1, max_value=12, value=3, step=1, key="pred_lb")
     with col_p2:
-        create_lookback_days = st.number_input("Create-rate window (days)", min_value=14, max_value=180, value=90, step=7, key="pred_cr_days")
+        weighted = st.checkbox("Weighted by recency", value=True, key="pred_wt")
     with col_p3:
-        use_activity = st.checkbox("Use recent activity uplift", value=True, key="pred_use_act")
+        show_by_source = st.checkbox("Show by JetLearn Deal Source", value=True, key="pred_by_src")
 
-    if use_activity:
-        col_opt1, col_opt2 = st.columns([1,1])
-        with col_opt1:
-            act_days = st.number_input("Recent activity window (days)", min_value=3, max_value=30, value=7, step=1, key="pred_act_days")
-        with col_opt2:
-            st.caption("Recent activity slightly boosts C1/C2+ where older leads show fresh touches.")
+    # Build history & forecast
+    hist_tot, hist_src = _build_history(df_f, pay_col, source_col, today, int(lookback))
+    daily_rate, proj_total, hist_details = _forecast_current_month(hist_tot, today, bool(weighted))
 
-    # Optional: map last-connected / last-activity
-    last_connected_col = find_col(df, ["Last Connected", "Last connected", "Last Contacted", "Last contacted"])
-    last_activity_col  = find_col(df, ["Last Activity Date", "Last activity date", "Last Activity", "Last activity"])
+    # Current month status
+    cur_s, cur_e, cur_days = _month_bounds_for(today)
+    pay_now = _safe_date_series(df_f, pay_col)
+    created_now = _safe_date_series(df_f, create_col)
+    mtd_paid = int(pay_now.between(cur_s, today).sum()) if pay_now.notna().any() else 0
+    mtd_created = int(created_now.between(cur_s, today).sum()) if created_now.notna().any() else 0
+    days_done = (today - cur_s).days + 1
+    progress = days_done / cur_days if cur_days else 0.0
+    proj_line_today = int(round(proj_total * progress)) if proj_total else 0
 
-    # Build components
-    comps, rates = forecast_components(
-        df_scope=df_f,
-        create_col=create_col,
-        pay_col=pay_col,
-        source_col=source_col,
-        country_col=country_col,
-        today=today,
-        hist_months_back=int(hist_months_back),
-        create_lookback_days=int(create_lookback_days),
-        activity_weight=bool(use_activity),
-        activity_days=int(st.session_state.get("pred_act_days", 7)),
-        last_connected_col=last_connected_col,
-        last_activity_col=last_activity_col,
-    )
-
-    # Current-month actuals so far (A) and projection (A+B+C)
-    cur_start, cur_end = month_bounds(today)
-    mtd_paid = int(coerce_datetime(df_f[pay_col]).dt.date.between(cur_start, today).sum()) if pay_col in df_f.columns else 0
-    mtd_created = int(coerce_datetime(df_f[create_col]).dt.date.between(cur_start, today).sum()) if create_col in df_f.columns else 0
-    proj_total = int(round(comps["TotalProjected"].sum())) if not comps.empty else 0
-    remaining_days = max(0, (cur_end - today).days)
-
-    # Header KPIs (unchanged layout)
+    # Header KPIs
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Created (MTD)", mtd_created)
     with c2: st.metric("Enrolments (MTD)", mtd_paid)
     with c3: st.metric("Forecast (EOM Enrolments)", proj_total)
-    with c4:
-        # Show implied avg daily to EOM
-        avg_future = (proj_total - mtd_paid) / remaining_days if remaining_days>0 else 0.0
-        st.metric("Implied Daily (rest of month)", f"{avg_future:.2f}")
+    with c4: st.metric("Avg Daily Enrolments", f"{daily_rate:.2f}")
 
-    # Tables
-    if comps.empty:
-        st.info("No data in scope to compute forecast.")
-    else:
-        st.markdown("### Components by Source & Country")
-        show_cols = ["Source","Country","A","B1","B2","C1","C2p","TotalProjected","rate_sm","dr_create","dr_lag0","dr_lag1","dr_lag2p"]
-        st.dataframe(comps[show_cols], use_container_width=True)
+    # By-source (MTD)
+    if show_by_source:
+        if source_col and source_col in df_f.columns:
+            src_series = df_f[source_col].fillna("Unknown").astype(str).str.strip()
+        else:
+            src_series = pd.Series("All", index=df_f.index)
+        m_mask = pay_now.between(cur_s, today) if pay_now.notna().any() else pd.Series(False, index=df_f.index)
+        if m_mask.any():
+            by_src = (
+                pd.DataFrame({"Source": src_series.loc[m_mask]})
+                .assign(Enrolments=1)
+                .groupby("Source", as_index=False)["Enrolments"].sum()
+                .sort_values("Enrolments", ascending=False)
+            )
+        else:
+            by_src = pd.DataFrame(columns=["Source","Enrolments"])
+        st.markdown("### Running Month — By Source (Enrolments MTD)")
+        st.dataframe(by_src, use_container_width=True)
+        st.download_button("Download CSV — By Source (MTD)",
+                           data=by_src.to_csv(index=False).encode("utf-8"),
+                           file_name="predictibility_by_source_mtd.csv",
+                           mime="text/csv",
+                           key="pred_src_mtd_dl")
 
-        st.download_button(
-            "Download CSV — Predictibility components",
-            data=comps[show_cols].to_csv(index=False).encode("utf-8"),
-            file_name="predictibility_components.csv",
-            mime="text/csv",
-            key="pred_comps_dl",
-        )
+    # A/B/C grading from lookback history
+    abc = _pareto_abc(hist_src)
+    st.markdown("### Source Grading (A/B/C) — Historical share (lookback)")
+    st.dataframe(abc, use_container_width=True)
+    st.download_button("Download CSV — Source Grades (history)",
+                       data=abc.to_csv(index=False).encode("utf-8"),
+                       file_name="predictibility_source_grades.csv",
+                       mime="text/csv",
+                       key="pred_abc_dl")
 
-        # Stacked bar: A vs B (B1+B2) vs C (C1+C2+)
-        plot_df = comps.copy()
-        plot_df["B"] = plot_df["B1"] + plot_df["B2"]
-        plot_df["C"] = plot_df["C1"] + plot_df["C2p"]
-        melt = plot_df.melt(
-            id_vars=["Source","Country"],
-            value_vars=["A","B","C"],
-            var_name="Component",
-            value_name="Value"
-        )
-        melt["Key"] = melt["Source"] + " • " + melt["Country"]
-        comp_chart = (
-            alt.Chart(melt)
-            .mark_bar()
-            .encode(
-                x=alt.X("Key:N", sort="-y", title="Source • Country"),
-                y=alt.Y("Value:Q", stack=True, title="Enrolments"),
-                color=alt.Color("Component:N", title="", scale=alt.Scale(
-                    domain=["A","B","C"], range=[PALETTE["A_actual"], PALETTE["Rem_same"], PALETTE["Rem_prev"]]
-                )),
-                tooltip=[alt.Tooltip("Key:N"), alt.Tooltip("Component:N"), alt.Tooltip("Value:Q", format=",.1f")]
-            ).properties(height=360, title="Predictibility components (A + B + C)")
-        )
-        st.altair_chart(comp_chart, use_container_width=True)
+    # Lookback month details (daily rates)
+    if not hist_details.empty:
+        st.markdown("#### Lookback Months — Daily rates")
+        st.dataframe(hist_details, use_container_width=True)
 
-    # Cumulative line chart (actual vs projected trajectory)
-    st.markdown("### Enrolments — Daily cumulative (Current vs Last) + Projected")
+    # Chart: cumulative enrolments (current vs last) + forecast trajectory
+    st.markdown("### Enrolments — Daily cumulative (Current vs Last month)")
     cur_s2, cur_e2, cur_days2, cur_cum, last_s, last_e, last_days, last_cum = _current_month_series(df_f, pay_col, today)
+
     if not cur_cum.empty:
         df_cur = cur_cum.reset_index(); df_cur.columns = ["Date","Cumulative"]; df_cur["Series"] = "This month"
         df_last = last_cum.reset_index(); df_last.columns = ["Date","Cumulative"]; df_last["Series"] = "Last month"
 
-        # build projected straight line from 0 to proj_total
+        # Forecast straight-line to month-end
         traj_dates = pd.date_range(cur_s2, cur_e2, freq="D")
         traj_vals = np.linspace(0, proj_total, len(traj_dates))
-        df_traj = pd.DataFrame({"Date": traj_dates, "Cumulative": traj_vals, "Series":"Projected (A+B+C)"})
+        df_traj = pd.DataFrame({"Date": traj_dates, "Cumulative": traj_vals, "Series":"Forecast (linear)"})
 
         chart_df = pd.concat([df_cur, df_last, df_traj], ignore_index=True)
         chart = (
             alt.Chart(chart_df)
-            .mark_line()
+            .mark_line(point=False)
             .encode(
                 x=alt.X("Date:T", title="Date"),
                 y=alt.Y("Cumulative:Q", title="Cumulative enrolments"),
                 color=alt.Color("Series:N", title="", legend=alt.Legend(orient="bottom")),
                 tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Series:N"), alt.Tooltip("Cumulative:Q")]
-            ).properties(height=360)
+            )
+            .properties(height=360)
         )
         st.altair_chart(chart, use_container_width=True)
+        st.caption(f"Forecast to month-end: *{proj_total}* enrolments • Expected by today (linear): *{proj_line_today}*")
     else:
-        st.info("No enrolments recorded this month yet.")
+        st.info("No enrolments recorded this month yet, so the chart is empty.")
 
-    # Small comparison: Actual MTD vs Projected EOM (bar)
-    cmp_df = pd.DataFrame({
-        "Metric": ["Actual MTD", "Projected EOM"],
-        "Value":  [mtd_paid, proj_total],
+    # Totals download
+    totals = pd.DataFrame({
+        "Created MTD": [mtd_created],
+        "Enrolments MTD": [mtd_paid],
+        "Avg Daily (lookback)": [daily_rate],
+        "Forecast EOM": [proj_total],
+        "Month": [cur_s.strftime('%Y-%m')]
     })
-    cmp_chart = (
-        alt.Chart(cmp_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("Metric:N", title=""),
-            y=alt.Y("Value:Q", title="Enrolments"),
-            tooltip=[alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q")]
-        ).properties(height=260, title="Actual vs Projected")
-    )
-    st.altair_chart(cmp_chart, use_container_width=True)
-
-    # ----------------
-    # Accuracy (backtest)
-    # ----------------
-    st.markdown("### Forecast accuracy (backtest)")
-    bt, acc = backtest_predictibility(
-        df_scope=df_f,
-        create_col=create_col,
-        pay_col=pay_col,
-        source_col=source_col,
-        country_col=country_col,
-        months_back_test=6,
-        hist_months_back=int(hist_months_back),
-        create_lookback_days=int(create_lookback_days),
-    )
-
-    col_a1, col_a2, col_a3, col_a4, col_a5 = st.columns(5)
-    with col_a1: st.metric("MAPE", f"{(acc['MAPE']*100):.1f}%" if pd.notna(acc['MAPE']) else "—")
-    with col_a2: st.metric("WAPE", f"{(acc['WAPE']*100):.1f}%" if pd.notna(acc['WAPE']) else "—")
-    with col_a3: st.metric("MAE",  f"{acc['MAE']:.2f}" if pd.notna(acc['MAE']) else "—")
-    with col_a4: st.metric("RMSE", f"{acc['RMSE']:.2f}" if pd.notna(acc['RMSE']) else "—")
-    with col_a5: st.metric("R²",   f"{acc['R2']:.3f}" if pd.notna(acc['R2']) else "—")
-
-    if not bt.empty:
-        st.dataframe(bt, use_container_width=True)
-        st.download_button(
-            "Download CSV — Backtest",
-            data=bt.to_csv(index=False).encode("utf-8"),
-            file_name="predictibility_backtest.csv",
-            mime="text/csv",
-            key="pred_bt_dl",
-        )
+    st.download_button("Download CSV — Predictibility (totals)",
+                       data=totals.to_csv(index=False).encode("utf-8"),
+                       file_name="predictibility_totals.csv",
+                       mime="text/csv",
+                       key="pred_totals_dl")
 
 
 
