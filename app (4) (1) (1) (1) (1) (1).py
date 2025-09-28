@@ -968,7 +968,8 @@ def predict_running_month(
 
 
 # ===== TAB: Predictability =====
-elif view == "Predictability":
+# --- Predictability tab ---
+if view == "Predictability":
     st.subheader("Predictability")
 
     # Controls
