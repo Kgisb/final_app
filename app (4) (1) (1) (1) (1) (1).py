@@ -1103,6 +1103,11 @@ elif view == "Trend & Analysis":
         _create_dt = coerce_datetime(df_f[create_col]).dt.date if (create_col and create_col in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
         _pay_dt    = coerce_datetime(df_f[pay_col]).dt.date    if (pay_col    and pay_col    in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
 
+        # Calibration event dates (exact column names from your sheet)
+        _first_dt   = coerce_datetime(df_f[first_cal_sched_col]).dt.date if (first_cal_sched_col and first_cal_sched_col in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+        _resched_dt = coerce_datetime(df_f[cal_resched_col]).dt.date     if (cal_resched_col and cal_resched_col in df_f.columns)     else pd.Series(pd.NaT, index=df_f.index)
+        _done_dt    = coerce_datetime(df_f[cal_done_col]).dt.date        if (cal_done_col and cal_done_col in df_f.columns)            else pd.Series(pd.NaT, index=df_f.index)
+
         # Referral source & intent
         _src_series = df_f[source_col].fillna("").astype(str).str.strip().str.lower() if (source_col and source_col in df_f.columns) else pd.Series("", index=df_f.index)
         _is_referral = _src_series.str.contains("referr", na=False)  # matches "referral", "referrals", etc.
@@ -1122,30 +1127,46 @@ elif view == "Trend & Analysis":
             ("This Month", _tm_start, _tm_end_mtd),  # MTD up to today
         ]
 
-        # ---- UPDATED: function includes the 2 new conversion metrics ----
+        # ---- UPDATED: function includes conversion + calibration metrics ----
         def _kpi_for_window(start_d, end_d):
             # Base masks by window
             _created_in_win = _between_dates(_create_dt, start_d, end_d)
             _paid_in_win    = _between_dates(_pay_dt,    start_d, end_d)
 
-            # Base paid mask per mode
+            # Calibration event windows
+            _first_in_win   = _between_dates(_first_dt,   start_d, end_d)
+            _resch_in_win   = _between_dates(_resched_dt, start_d, end_d)
+            _done_in_win    = _between_dates(_done_dt,    start_d, end_d)
+
+            # Mode-aware masks
             if level == "MTD":
-                # Payments in window among deals CREATED in the same window
-                _paid_mask = (_paid_in_win & _created_in_win)
+                # Event in window AND deal created in same window
+                _paid_mask  = (_paid_in_win  & _created_in_win)
+                _first_mask = (_first_in_win & _created_in_win)
+                _resch_mask = (_resch_in_win & _created_in_win)
+                _done_mask  = (_done_in_win  & _created_in_win)
             else:
-                # Cohort: payments in window irrespective of Create Date
-                _paid_mask = _paid_in_win
+                # Cohort: event-by-date in window; Create Date can be any month
+                _paid_mask  = _paid_in_win
+                _first_mask = _first_in_win
+                _resch_mask = _resch_in_win
+                _done_mask  = _done_in_win
 
             # Core KPIs
             _enrol = int(_paid_mask.sum())
 
             # Created-by-window metrics
-            _ref_created = (_created_in_win & _is_referral)
+            _ref_created  = (_created_in_win & _is_referral)
             _self_created = (_ref_created & _is_sales_generated)
 
-            # NEW: conversion KPIs (by payment date window, using paid mask)
-            _referral_conv     = int((_paid_mask & _is_referral).sum())
-            _selfgen_ref_conv  = int((_paid_mask & _is_sales_generated).sum())
+            # Conversion KPIs (by payment date window)
+            _referral_conv    = int((_paid_mask & _is_referral).sum())
+            _selfgen_ref_conv = int((_paid_mask & _is_sales_generated).sum())
+
+            # Calibration KPIs
+            _first_cal_cnt   = int(_first_mask.sum())
+            _resched_cal_cnt = int(_resch_mask.sum())
+            _cal_done_cnt    = int(_done_mask.sum())
 
             return {
                 "Deals Created": int(_created_in_win.sum()),
@@ -1154,6 +1175,9 @@ elif view == "Trend & Analysis":
                 "Self-Gen Referrals": int(_self_created.sum()),
                 "Referral Conversion": _referral_conv,
                 "Self-Gen Referral Conversion": _selfgen_ref_conv,
+                "First Calibration": _first_cal_cnt,
+                "Rescheduled Calibration": _resched_cal_cnt,
+                "Calibration Done": _cal_done_cnt,
             }
 
         # Render 4 KPI cards
@@ -1180,8 +1204,18 @@ elif view == "Trend & Analysis":
                       <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
                         <span>Referral Conversion</span><span><strong>{_m['Referral Conversion']}</strong></span>
                       </div>
-                      <div style="display:flex; justify-content:space-between;">
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
                         <span>Self-Gen Referral Conversion</span><span><strong>{_m['Self-Gen Referral Conversion']}</strong></span>
+                      </div>
+                      <hr style="border:none;border-top:1px solid #eee;margin:8px 0;">
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                        <span>First Calibration</span><span><strong>{_m['First Calibration']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                        <span>Rescheduled Calibration</span><span><strong>{_m['Rescheduled Calibration']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between;">
+                        <span>Calibration Done</span><span><strong>{_m['Calibration Done']}</strong></span>
                       </div>
                     </div>
                     """,
@@ -1432,6 +1466,7 @@ elif view == "Trend & Analysis":
             mime="text/csv",
             key="ta_ref_business_dl"
         )
+
 
 
 
