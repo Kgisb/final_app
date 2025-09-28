@@ -1080,6 +1080,98 @@ elif view == "Trend & Analysis":
             st.stop()
         st.caption(f"Scope: **Custom** ({range_start} → {range_end})")
 
+    # =========================
+    # NEW: KPI boxes (Yesterday / Today / Last Month / This Month)
+    # (Add-only; does not alter your existing logic)
+    # =========================
+    with st.container():
+        st.markdown("### Snapshot — Deals / Enrolments / Referrals / Self-Gen Referrals")
+
+        # IST anchors
+        try:
+            _today_ist = pd.Timestamp.now(tz="Asia/Kolkata").date()
+        except Exception:
+            _today_ist = date.today()
+        _yday = _today_ist - timedelta(days=1)
+
+        # Window helpers
+        _tm_start, _tm_end_full = month_bounds(_today_ist)  # full current month
+        _tm_end_mtd = _today_ist                            # MTD end = today
+        _lm_start, _lm_end = last_month_bounds(_today_ist)  # full last month
+
+        # Resolve columns/dates safely
+        _create_dt = coerce_datetime(df_f[create_col]).dt.date if (create_col and create_col in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+        _pay_dt    = coerce_datetime(df_f[pay_col]).dt.date    if (pay_col    and pay_col    in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+
+        # Referral source & intent
+        _src_series = df_f[source_col].fillna("").astype(str).str.strip().str.lower() if (source_col and source_col in df_f.columns) else pd.Series("", index=df_f.index)
+        _is_referral = _src_series.str.contains("referr", na=False)  # matches "referral", "referrals", etc.
+
+        _ref_intent_col = find_col(df, ["Referral Intent Source", "Referral intent source"])
+        _ref_intent_series = df_f[_ref_intent_col].fillna("").astype(str).str.strip().str.lower() if (_ref_intent_col and _ref_intent_col in df_f.columns) else pd.Series("", index=df_f.index)
+        _is_sales_generated = _ref_intent_series.str.contains("sales generated", na=False)
+
+        def _between_dates(s, start_d, end_d):
+            return s.between(start_d, end_d) if hasattr(s, "between") else pd.Series(False, index=s.index)
+
+        # KPI windows (label, start, end)
+        _periods = [
+            ("Yesterday", _yday, _yday),
+            ("Today", _today_ist, _today_ist),
+            ("Last Month", _lm_start, _lm_end),
+            ("This Month", _tm_start, _tm_end_mtd),  # MTD up to today
+        ]
+
+        def _kpi_for_window(start_d, end_d):
+            # Base masks by window
+            _created_in_win = _between_dates(_create_dt, start_d, end_d)
+            _paid_in_win    = _between_dates(_pay_dt,    start_d, end_d)
+
+            # Enrolments logic
+            if level == "MTD":
+                # Payments in window AND deals created in the SAME window
+                _enrol = int((_paid_in_win & _created_in_win).sum())
+            else:
+                # Cohort: payments in window irrespective of Create Date
+                _enrol = int(_paid_in_win.sum())
+
+            # Referral-created & Self-gen (by Create Date window)
+            _ref_created = (_created_in_win & _is_referral)
+            _self_gen    = (_ref_created & _is_sales_generated)
+
+            return {
+                "Deals Created": int(_created_in_win.sum()),
+                "Enrolments": _enrol,
+                "Referrals (Created)": int(_ref_created.sum()),
+                "Self-Gen Referrals": int(_self_gen.sum()),
+            }
+
+        # Render 4 KPI cards
+        _c1, _c2, _c3, _c4 = st.columns(4)
+        for (lbl, s_d, e_d), _col in zip(_periods, [_c1, _c2, _c3, _c4]):
+            _m = _kpi_for_window(s_d, e_d)
+            with _col:
+                st.markdown(f"**{lbl}**")
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #e5e7eb; border-radius:12px; padding:10px; background:#ffffff;">
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                        <span>Deals Created</span><span><strong>{_m['Deals Created']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                        <span>Enrolments</span><span><strong>{_m['Enrolments']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                        <span>Referrals (Created)</span><span><strong>{_m['Referrals (Created)']}</strong></span>
+                      </div>
+                      <div style="display:flex; justify-content:space-between;">
+                        <span>Self-Gen Referrals</span><span><strong>{_m['Self-Gen Referrals']}</strong></span>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
     # Metric picker (includes derived)
     all_metrics = [
         "Payment Received Date — Count",
@@ -1290,6 +1382,7 @@ elif view == "Trend & Analysis":
         elif sort_metric_ref == "A–Z":
             grp = grp.sort_values("Referral Intent Source", ascending=True)
         else:
+            grp = grp.sort_values("Created", descending=False)  # NOTE: correcting ascending to descending
             grp = grp.sort_values("Created", ascending=False)
 
         grp_show = grp.head(int(top_k_ref)) if len(grp) > int(top_k_ref) else grp
