@@ -3136,7 +3136,7 @@ elif view == "Dashboard":
     st.subheader("Dashboard — Business Snapshot")
 
     # =========================
-    # Pick base dataframe used elsewhere in your app
+    # Base dataframe
     # =========================
     try:
         base = df_f.copy()
@@ -3144,7 +3144,7 @@ elif view == "Dashboard":
         base = df.copy()
 
     # =========================
-    # Local helpers (self-contained)
+    # Helpers
     # =========================
     def _get_col(dframe, candidates):
         """Return the first existing column from candidates (exact, stripped, case-insensitive)."""
@@ -3187,7 +3187,7 @@ elif view == "Dashboard":
     # Columns (aligned to your sheet)
     # =========================
     CREATE_COL  = _get_col(base, ["Create Date"])
-    PAY_COL     = _get_col(base, ["Payment Received Date", "Payment Received Date "])  # note trailing-space variant
+    PAY_COL     = _get_col(base, ["Payment Received Date", "Payment Received Date "])  # tolerant to trailing space
     SRC_COL     = _get_col(base, ["JetLearn Deal Source", "_src_raw"])
     REF_INTENT  = _get_col(base, ["Referral Intent Source"])
 
@@ -3205,16 +3205,15 @@ elif view == "Dashboard":
     # =========================
     c_dt = _to_dt(base[CREATE_COL]) if CREATE_COL else pd.Series(pd.NaT, index=base.index)
     p_dt = _to_dt(base[PAY_COL])    if PAY_COL   else pd.Series(pd.NaT, index=base.index)
-
     src  = _norm_str(base[SRC_COL])     if SRC_COL    else pd.Series("", index=base.index)
     rint = _norm_str(base[REF_INTENT])  if REF_INTENT else pd.Series("", index=base.index)
 
-    # Referral/intent matchers (robust to "Referrals", mixed case & variants)
+    # Matchers (robust to "Referrals" plural and intent variants like "Gift Card - Sales Generated")
     is_referral = src.str.contains("referr", case=False, na=False)
     is_sales_generated = rint.str.contains(r"Sales Generated", case=False, na=False)
 
     # =========================
-    # Time windows (Asia/Kolkata)
+    # Windows (IST)
     # =========================
     now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
     today = now_ist.date()
@@ -3224,67 +3223,53 @@ elif view == "Dashboard":
     tm_start = today.replace(day=1)
     tm_end = today
 
-    # Last Month (full calendar month)
+    # Last Month (full calendar)
     lm_start, lm_end = _month_bounds((pd.Timestamp(tm_start) - pd.Timedelta(days=1)).date())
 
     # =========================
-    # Mode toggle (definitions per your message)
+    # Mode toggle (your definitions)
     # =========================
     mode = st.radio(
         "Counting mode",
-        ["Cohort", "MTD"],  # default Cohort
+        ["Cohort", "MTD"],
         index=0,
         horizontal=True,
         help=(
-            "Cohort: Outputs in the selected window by their own event date; Create Date can be anything.\n"
-            "MTD: Only count outputs for deals CREATED in the SAME window (same day/month)."
+            "Cohort: Outputs by their own event date in the window; Create Date can be anything. "
+            "MTD: Count outputs only for deals CREATED in the SAME window (day/month)."
         ),
     )
 
     # =========================
-    # Metric computer
+    # Metric computer (mode-dependent enrolments)
     # =========================
     def compute_metrics(window_start, window_end):
         """
         Cohort:
-          - Enrolments: Payment Received Date in window (Create Date ignored)
-          - Created / Referral Created / Referral–Sales Generated: Create Date in window
+          - Enrolments = Payment Received Date in window (Create Date ignored)
+          - Deals/Referral Created/Referral–Sales Generated = Create Date in window
         MTD:
-          - Restrict to deals created in THIS window, then:
-            - Enrolments: payments in window among those deals
-            - Referral–Sales Generated: among referral deals created in window, intent flag
-            - Created / Referral Created: by Create Date in window (same)
+          - Restrict to deals created in THIS window; Enrolments = payments in window among those deals
         """
         # Base masks for the window
         created_in_window = _between(c_dt, window_start, window_end)
         payments_in_window = _between(p_dt, window_start, window_end)
 
         if mode == "Cohort":
-            # Enrolments ignore Create Date
-            enrol_count = int(payments_in_window.sum())
-
-            # Create-based metrics
+            enrol_count = int(payments_in_window.sum())  # ignore Create Date
             ref_created = created_in_window & is_referral
             ref_sales = ref_created & is_sales_generated
-
             return {
                 "Deals Created": int(created_in_window.sum()),
                 "Enrolments": enrol_count,
                 "Referral Deals Created": int(ref_created.sum()),
                 "Referral – Sales Generated": int(ref_sales.sum()),
             }
-
-        else:  # MTD
-            # Restrict population to deals created in THIS window
-            cohort_mask = created_in_window
-
-            # Enrolments: payments in window among cohort deals
-            enrol_count = int((payments_in_window & cohort_mask).sum())
-
-            # Create-based metrics (same window)
+        else:
+            cohort_mask = created_in_window  # deals created in the SAME window
+            enrol_count = int((payments_in_window & cohort_mask).sum())  # payments in window among cohort deals
             ref_created = cohort_mask & is_referral
             ref_sales = ref_created & is_sales_generated
-
             return {
                 "Deals Created": int(cohort_mask.sum()),
                 "Enrolments": enrol_count,
